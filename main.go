@@ -1,12 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
@@ -40,7 +45,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// 2. Bot Connection
 	dg, err := discordgo.New("Bot " + token)
 	if err != nil {
 		log.Fatal(err)
@@ -55,7 +59,7 @@ func main() {
 	}
 	defer dg.Close()
 
-	// 3. Register Commands
+	// Register commands
 	commands := []*discordgo.ApplicationCommand{
 		{
 			Name:        "gym",
@@ -64,6 +68,18 @@ func main() {
 		{
 			Name:        "leaderboard",
 			Description: "Show the top gym-goers",
+		},
+		{
+			Name:        "insult",
+			Description: "Get a gym-related insult",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionUser,
+					Name:        "user",
+					Description: "The user you want to roast",
+					Required:    true,
+				},
+			},
 		},
 	}
 
@@ -91,7 +107,66 @@ func onInteraction(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		handleGymLog(s, i)
 	case "leaderboard":
 		handleLeaderboard(s, i)
+	case "insult":
+		handleInsult(s, i)
 	}
+}
+
+func handleInsult(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	// 1. Tell Discord to wait (The "Bot is thinking..." state)
+	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+	})
+	if err != nil {
+		log.Printf("Error deferring: %v", err)
+		return
+	}
+
+	// Check if a username option is provided
+	options := i.ApplicationCommandData().Options
+	var targetUser *discordgo.User
+
+	if len(options) > 0 && options[0].Name == "user" {
+		// If a user is specified, use that user
+		targetUser = options[0].UserValue(s)
+	} else {
+		// Default to the user who invoked the command
+		targetUser = i.Member.User
+	}
+
+	// Use context with timeout for better control
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Query to calculate days since last workout and workouts this week
+	var daysSinceLastWorkout int
+	var workoutsThisWeek int
+	err = db.QueryRowContext(ctx, `
+		SELECT 
+			COALESCE(CAST(julianday('now') - julianday(MAX(timestamp)) AS INT), -1) AS days_since_last,
+			COALESCE(SUM(CASE WHEN strftime('%W', timestamp) = strftime('%W', 'now') THEN 1 ELSE 0 END), 0) AS workouts_this_week
+		FROM workouts
+		WHERE user_id = ?
+	`, targetUser.ID).Scan(&daysSinceLastWorkout, &workoutsThisWeek)
+
+	if err != nil {
+		sendResponse(s, i, "❌ Could not retrieve workout data.")
+		log.Printf("Error querying workout data for user %s: %v", targetUser.Username, err)
+		return
+	}
+
+	// Generate insult using the generateInsult function
+	insult := GenerateInsult(targetUser.Username, workoutsThisWeek, daysSinceLastWorkout)
+
+	// 3. Update the "Thinking" message with the final insult
+	_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Content: &insult,
+	})
+	if err != nil {
+		log.Printf("Error editing response: %v", err)
+	}
+
+	//sendResponse(s, i, insult)
 }
 
 func handleGymLog(s *discordgo.Session, i *discordgo.InteractionCreate) {
@@ -269,4 +344,59 @@ func initializeDb(db *sql.DB) error {
 	db.SetConnMaxLifetime(5 * time.Minute)
 
 	return nil
+}
+
+type OllamaRequest struct {
+	Model  string `json:"model"`
+	Prompt string `json:"prompt"`
+	Stream bool   `json:"stream"`
+}
+
+type OllamaResponse struct {
+	Response string `json:"response"`
+}
+
+func GenerateInsult(username string, sessionsThisWeek int, daysSinceLastSession int) string {
+	url := "http://localhost:11434/api/generate"
+
+	// The "Context" is built here
+	prompt := fmt.Sprintf(`
+        You are a funny, sarcastic, and punny gym bro. Like the Gordan Ramsay of the fitness world. 
+        Your job is to roast users who are slacking.
+        User: %s
+        Days since last workout: %d
+        Total workouts this week: %d
+
+        Write a 1-sentence devastating roast based on any of the above stats or not but just make it funny to the others. 
+        Be creative, use gym slang, and don't be generic.`,
+		username, daysSinceLastSession, sessionsThisWeek)
+
+	payload := OllamaRequest{
+		Model:  "llama3",
+		Prompt: prompt,
+		Stream: false,
+	}
+
+	jsonData, _ := json.Marshal(payload)
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Sprintf("%s is so lazy even the AI gave up on roasting them.", username)
+	}
+	defer resp.Body.Close()
+
+	var ollamaResp OllamaResponse
+	json.NewDecoder(resp.Body).Decode(&ollamaResp)
+	return cleanInsult(ollamaResp.Response)
+}
+
+func cleanInsult(raw string) string {
+	// 1. Unquote the string if it's double-encoded (removes \" and outer quotes)
+	unquoted, err := strconv.Unquote(raw)
+	if err != nil {
+		// If it fails, it wasn't double-quoted, so just use the original
+		unquoted = raw
+	}
+
+	// 2. Manually trim any remaining literal quote marks that the AI might have added
+	return strings.Trim(unquoted, "\" ")
 }

@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  gym-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gym-bot
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - GYM_CHANNEL_ID=${GYM_CHANNEL_ID}
+    volumes:
+      - .:/app
+    depends_on:
+      - ollama
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/llama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    environment:
+      - MODEL=llama2
+      - DEVICE=cpu
+    restart: unless-stopped
