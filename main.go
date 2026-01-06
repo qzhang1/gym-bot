@@ -81,6 +81,34 @@ func main() {
 				},
 			},
 		},
+		{
+			Name:        "compliment",
+			Description: "Get a gym-related compliment",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionUser,
+					Name:        "user",
+					Description: "The user you want to praise",
+					Required:    true,
+				},
+			},
+		},
+		{
+			Name:        "stats",
+			Description: "View your gym statistics",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionUser,
+					Name:        "user",
+					Description: "The user whose stats you want to see (optional)",
+					Required:    false,
+				},
+			},
+		},
+		{
+			Name:        "streaks",
+			Description: "Show the top current streaks",
+		},
 	}
 
 	for _, v := range commands {
@@ -109,6 +137,67 @@ func onInteraction(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		handleLeaderboard(s, i)
 	case "insult":
 		handleInsult(s, i)
+	case "compliment":
+		handleCompliment(s, i)
+	case "stats":
+		handleStats(s, i)
+	case "streaks":
+		handleStreaks(s, i)
+	}
+}
+
+func handleCompliment(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	// 1. Tell Discord to wait (The "Bot is thinking..." state)
+	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+	})
+	if err != nil {
+		log.Printf("Error deferring: %v", err)
+		return
+	}
+
+	// Check if a username option is provided
+	options := i.ApplicationCommandData().Options
+	var targetUser *discordgo.User
+
+	if len(options) > 0 && options[0].Name == "user" {
+		// If a user is specified, use that user
+		targetUser = options[0].UserValue(s)
+	} else {
+		// Default to the user who invoked the command
+		targetUser = i.Member.User
+	}
+
+	// Use context with timeout for better control
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Query to calculate days since last workout and workouts this week
+	var daysSinceLastWorkout int
+	var workoutsThisWeek int
+	err = db.QueryRowContext(ctx, `
+		SELECT 
+			COALESCE(CAST(julianday('now') - julianday(MAX(timestamp)) AS INT), -1) AS days_since_last,
+			COALESCE(SUM(CASE WHEN strftime('%W', timestamp) = strftime('%W', 'now') THEN 1 ELSE 0 END), 0) AS workouts_this_week
+		FROM workouts
+		WHERE user_id = ?
+	`, targetUser.ID).Scan(&daysSinceLastWorkout, &workoutsThisWeek)
+
+	if err != nil {
+		sendResponse(s, i, "❌ Could not retrieve workout data.")
+		log.Printf("Error querying workout data for user %s: %v", targetUser.Username, err)
+		return
+	}
+
+	// Generate insult using the generateInsult function
+	insult := GenerateCompliment(targetUser.Username, workoutsThisWeek, daysSinceLastWorkout)
+
+	// 3. Update the "Thinking" message with the final insult
+	_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Content: &insult,
+	})
+	if err != nil {
+		log.Printf("Error editing response: %v", err)
 	}
 }
 
@@ -218,7 +307,28 @@ func handleGymLog(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		return
 	}
 
-	sendResponse(s, i, fmt.Sprintf("🏋️ **%s**, workout logged! You've gone **%d** times in %d.", user.Username, total, currentYear))
+	// Calculate current streak after committing
+	currentStreak := calculateCurrentStreak(ctx, user.ID)
+
+	// Build response message
+	message := fmt.Sprintf("🏋️ **%s**, workout logged! You've gone **%d** times in %d.", user.Username, total, currentYear)
+
+	if currentStreak > 0 {
+		message += fmt.Sprintf(" 🔥 Current streak: **%d days**!", currentStreak)
+	}
+
+	// Special milestone messages
+	if currentStreak == 7 {
+		message += " 🎉 **ONE WEEK STREAK!**"
+	} else if currentStreak == 30 {
+		message += " 🎊 **ONE MONTH STREAK!**"
+	} else if currentStreak == 100 {
+		message += " 👑 **100 DAY STREAK! ABSOLUTE LEGEND!**"
+	} else if currentStreak%10 == 0 && currentStreak > 0 {
+		message += fmt.Sprintf(" 💪 Keep it up!")
+	}
+
+	sendResponse(s, i, message)
 }
 
 func handleLeaderboard(s *discordgo.Session, i *discordgo.InteractionCreate) {
@@ -250,7 +360,17 @@ func handleLeaderboard(s *discordgo.Session, i *discordgo.InteractionCreate) {
 			log.Printf("Error scanning row: %v", err)
 			continue
 		}
-		leaderboardText += fmt.Sprintf("%d. **%s** — %d sessions\n", rank, name, count)
+
+		emoji := ""
+		if rank == 1 {
+			emoji = "🥇"
+		} else if rank == 2 {
+			emoji = "🥈"
+		} else if rank == 3 {
+			emoji = "🥉"
+		}
+
+		leaderboardText += fmt.Sprintf("%s **%s** — %d sessions\n", emoji, name, count)
 		rank++
 	}
 
@@ -270,6 +390,332 @@ func handleLeaderboard(s *discordgo.Session, i *discordgo.InteractionCreate) {
 			},
 		},
 	})
+}
+
+func handleStats(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	options := i.ApplicationCommandData().Options
+	var targetUser *discordgo.User
+
+	if len(options) > 0 && options[0].Name == "user" {
+		targetUser = options[0].UserValue(s)
+	} else {
+		targetUser = i.Member.User
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Get comprehensive stats
+	var totalWorkouts, workoutsThisYear, workoutsThisMonth, workoutsThisWeek int
+	var currentStreak, longestStreak int
+	var lastWorkout sql.NullString
+
+	err := db.QueryRowContext(ctx, `
+		SELECT 
+			COUNT(*) as total,
+			SUM(CASE WHEN strftime('%Y', timestamp) = strftime('%Y', 'now') THEN 1 ELSE 0 END) as this_year,
+			SUM(CASE WHEN strftime('%Y-%m', timestamp) = strftime('%Y-%m', 'now') THEN 1 ELSE 0 END) as this_month,
+			SUM(CASE WHEN strftime('%W', timestamp) = strftime('%W', 'now') THEN 1 ELSE 0 END) as this_week,
+			MAX(timestamp) as last_workout
+		FROM workouts
+		WHERE user_id = ?
+	`, targetUser.ID).Scan(&totalWorkouts, &workoutsThisYear, &workoutsThisMonth, &workoutsThisWeek, &lastWorkout)
+
+	if err != nil {
+		sendResponse(s, i, "❌ Could not retrieve stats.")
+		log.Printf("Error querying stats: %v", err)
+		return
+	}
+
+	// Calculate streaks
+	currentStreak = calculateCurrentStreak(ctx, targetUser.ID)
+	longestStreak = calculateLongestStreak(ctx, targetUser.ID)
+
+	// Format last workout time
+	lastWorkoutStr := "Never"
+	if lastWorkout.Valid {
+		t, err := time.Parse("2006-01-02 15:04:05", lastWorkout.String)
+		if err == nil {
+			daysSince := int(time.Since(t).Hours() / 24)
+			if daysSince == 0 {
+				lastWorkoutStr = "Today"
+			} else if daysSince == 1 {
+				lastWorkoutStr = "Yesterday"
+			} else {
+				lastWorkoutStr = fmt.Sprintf("%d days ago", daysSince)
+			}
+		}
+	}
+
+	// Create embed
+	embed := &discordgo.MessageEmbed{
+		Title: fmt.Sprintf("📊 Gym Stats for %s", targetUser.Username),
+		Color: 0x3498db, // Blue
+		Fields: []*discordgo.MessageEmbedField{
+			{
+				Name:   "🔥 Current Streak",
+				Value:  fmt.Sprintf("%d days", currentStreak),
+				Inline: true,
+			},
+			{
+				Name:   "🏆 Longest Streak",
+				Value:  fmt.Sprintf("%d days", longestStreak),
+				Inline: true,
+			},
+			{
+				Name:   "⏱️ Last Workout",
+				Value:  lastWorkoutStr,
+				Inline: true,
+			},
+			{
+				Name:   "📅 This Week",
+				Value:  fmt.Sprintf("%d workouts", workoutsThisWeek),
+				Inline: true,
+			},
+			{
+				Name:   "📆 This Month",
+				Value:  fmt.Sprintf("%d workouts", workoutsThisMonth),
+				Inline: true,
+			},
+			{
+				Name:   "📈 This Year",
+				Value:  fmt.Sprintf("%d workouts", workoutsThisYear),
+				Inline: true,
+			},
+			{
+				Name:   "💪 All Time",
+				Value:  fmt.Sprintf("%d workouts", totalWorkouts),
+				Inline: false,
+			},
+		},
+		Timestamp: time.Now().Format(time.RFC3339),
+	}
+
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Embeds: []*discordgo.MessageEmbed{embed},
+		},
+	})
+}
+
+func handleStreaks(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Get all users with workouts
+	rows, err := db.QueryContext(ctx, `
+		SELECT DISTINCT user_id, username
+		FROM workouts
+	`)
+	if err != nil {
+		sendResponse(s, i, "❌ Could not retrieve streaks.")
+		log.Printf("Error querying users: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	type StreakInfo struct {
+		Username      string
+		CurrentStreak int
+		LongestStreak int
+	}
+
+	var streaks []StreakInfo
+	for rows.Next() {
+		var userID, username string
+		if err := rows.Scan(&userID, &username); err != nil {
+			continue
+		}
+
+		currentStreak := calculateCurrentStreak(ctx, userID)
+		longestStreak := calculateLongestStreak(ctx, userID)
+
+		streaks = append(streaks, StreakInfo{
+			Username:      username,
+			CurrentStreak: currentStreak,
+			LongestStreak: longestStreak,
+		})
+	}
+
+	if len(streaks) == 0 {
+		sendResponse(s, i, "No workouts logged yet!")
+		return
+	}
+
+	// Sort by current streak (bubble sort for simplicity)
+	for i := 0; i < len(streaks)-1; i++ {
+		for j := 0; j < len(streaks)-i-1; j++ {
+			if streaks[j].CurrentStreak < streaks[j+1].CurrentStreak {
+				streaks[j], streaks[j+1] = streaks[j+1], streaks[j]
+			}
+		}
+	}
+
+	// Build leaderboard text
+	currentStreakText := ""
+	longestStreakText := ""
+
+	for idx, streak := range streaks {
+		if idx < 10 { // Top 10 for current streaks
+			emoji := ""
+			if idx == 0 {
+				emoji = "🥇"
+			} else if idx == 1 {
+				emoji = "🥈"
+			} else if idx == 2 {
+				emoji = "🥉"
+			}
+			currentStreakText += fmt.Sprintf("%s **%s** — %d days\n", emoji, streak.Username, streak.CurrentStreak)
+		}
+	}
+
+	// Sort by longest streak for second section
+	for i := 0; i < len(streaks)-1; i++ {
+		for j := 0; j < len(streaks)-i-1; j++ {
+			if streaks[j].LongestStreak < streaks[j+1].LongestStreak {
+				streaks[j], streaks[j+1] = streaks[j+1], streaks[j]
+			}
+		}
+	}
+
+	for idx, streak := range streaks {
+		if idx < 5 { // Top 5 for longest streaks
+			longestStreakText += fmt.Sprintf("**%s** — %d days\n", streak.Username, streak.LongestStreak)
+		}
+	}
+
+	embed := &discordgo.MessageEmbed{
+		Title: "🔥 Gym Streaks",
+		Color: 0xff6b6b, // Red-orange
+		Fields: []*discordgo.MessageEmbedField{
+			{
+				Name:   "Current Streaks",
+				Value:  currentStreakText,
+				Inline: false,
+			},
+			{
+				Name:   "All-Time Longest Streaks",
+				Value:  longestStreakText,
+				Inline: false,
+			},
+		},
+		Timestamp: time.Now().Format(time.RFC3339),
+	}
+
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Embeds: []*discordgo.MessageEmbed{embed},
+		},
+	})
+}
+
+func calculateCurrentStreak(ctx context.Context, userID string) int {
+	// Get all workout dates for this user, ordered by date descending
+	rows, err := db.QueryContext(ctx, `
+		SELECT DISTINCT DATE(timestamp) as workout_date
+		FROM workouts
+		WHERE user_id = ?
+		ORDER BY workout_date DESC
+	`, userID)
+	if err != nil {
+		log.Printf("Error calculating current streak: %v", err)
+		return 0
+	}
+	defer rows.Close()
+
+	var dates []time.Time
+	for rows.Next() {
+		var dateStr string
+		if err := rows.Scan(&dateStr); err != nil {
+			continue
+		}
+		t, err := time.Parse("2006-01-02", dateStr)
+		if err != nil {
+			continue
+		}
+		dates = append(dates, t)
+	}
+
+	if len(dates) == 0 {
+		return 0
+	}
+
+	// Check if the most recent workout was today or yesterday
+	today := time.Now().Truncate(24 * time.Hour)
+	yesterday := today.AddDate(0, 0, -1)
+
+	if !dates[0].Equal(today) && !dates[0].Equal(yesterday) {
+		return 0 // Streak is broken
+	}
+
+	// Count consecutive days
+	streak := 0
+	expectedDate := today
+
+	for _, date := range dates {
+		if date.Equal(expectedDate) || date.Equal(expectedDate.AddDate(0, 0, -1)) {
+			if date.Before(expectedDate) {
+				streak++
+				expectedDate = date.AddDate(0, 0, -1)
+			}
+		} else {
+			break
+		}
+	}
+
+	return streak
+}
+
+func calculateLongestStreak(ctx context.Context, userID string) int {
+	// Get all workout dates for this user, ordered by date ascending
+	rows, err := db.QueryContext(ctx, `
+		SELECT DISTINCT DATE(timestamp) as workout_date
+		FROM workouts
+		WHERE user_id = ?
+		ORDER BY workout_date ASC
+	`, userID)
+	if err != nil {
+		log.Printf("Error calculating longest streak: %v", err)
+		return 0
+	}
+	defer rows.Close()
+
+	var dates []time.Time
+	for rows.Next() {
+		var dateStr string
+		if err := rows.Scan(&dateStr); err != nil {
+			continue
+		}
+		t, err := time.Parse("2006-01-02", dateStr)
+		if err != nil {
+			continue
+		}
+		dates = append(dates, t)
+	}
+
+	if len(dates) == 0 {
+		return 0
+	}
+
+	maxStreak := 1
+	currentStreak := 1
+
+	for i := 1; i < len(dates); i++ {
+		daysDiff := int(dates[i].Sub(dates[i-1]).Hours() / 24)
+
+		if daysDiff == 1 {
+			currentStreak++
+			if currentStreak > maxStreak {
+				maxStreak = currentStreak
+			}
+		} else {
+			currentStreak = 1
+		}
+	}
+
+	return maxStreak
 }
 
 func sendResponse(s *discordgo.Session, i *discordgo.InteractionCreate, msg string) {
@@ -381,6 +827,39 @@ func GenerateInsult(username string, sessionsThisWeek int, daysSinceLastSession 
 	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return fmt.Sprintf("%s is so lazy even the AI gave up on roasting them.", username)
+	}
+	defer resp.Body.Close()
+
+	var ollamaResp OllamaResponse
+	json.NewDecoder(resp.Body).Decode(&ollamaResp)
+	return cleanInsult(ollamaResp.Response)
+}
+
+func GenerateCompliment(username string, sessionsThisWeek int, daysSinceLastSession int) string {
+	url := "http://localhost:11434/api/generate"
+
+	// The "Context" is built here
+	prompt := fmt.Sprintf(`
+		You are a funny, uplifting, and punny gym bro. Like the Gordan Ramsay of the fitness world.
+		Your job is to compliment users who are doing great.
+		User: %s
+		Days since last workout: %d
+		Total workouts this week: %d
+
+		Write a 1-sentence hilarious compliment based on any of the above stats or not but just make it funny to the others.
+		Be creative, use gym slang, and don't be generic.`,
+		username, daysSinceLastSession, sessionsThisWeek)
+
+	payload := OllamaRequest{
+		Model:  "llama3",
+		Prompt: prompt,
+		Stream: false,
+	}
+
+	jsonData, _ := json.Marshal(payload)
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Sprintf("%s is so awesome even the AI couldn't help but praise them.", username)
 	}
 	defer resp.Body.Close()
 
