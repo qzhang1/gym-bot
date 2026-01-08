@@ -642,24 +642,20 @@ func calculateCurrentStreak(ctx context.Context, userID string) int {
 		return 0
 	}
 
-	// Check if the most recent workout was today or yesterday
 	today := time.Now().Truncate(24 * time.Hour)
 	yesterday := today.AddDate(0, 0, -1)
 
+	// Streak must start with today or yesterday
 	if !dates[0].Equal(today) && !dates[0].Equal(yesterday) {
-		return 0 // Streak is broken
+		return 0
 	}
 
 	// Count consecutive days
-	streak := 0
-	expectedDate := today
-
-	for _, date := range dates {
-		if date.Equal(expectedDate) || date.Equal(expectedDate.AddDate(0, 0, -1)) {
-			if date.Before(expectedDate) {
-				streak++
-				expectedDate = date.AddDate(0, 0, -1)
-			}
+	streak := 1
+	for i := 1; i < len(dates); i++ {
+		daysDiff := int(dates[i-1].Sub(dates[i]).Hours() / 24)
+		if daysDiff == 1 {
+			streak++
 		} else {
 			break
 		}
