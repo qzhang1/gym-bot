@@ -119,9 +119,34 @@ func main() {
 	}
 
 	fmt.Println("Gym Bot is active. Press CTRL+C to stop.")
+
+	// Send a startup message to the gym channel
+	sendStartupMessage(dg, gymChannelID)
+
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt)
 	<-stop
+
+	// Send a shutdown message to the gym channel
+	sendShutdownMessage(dg, gymChannelID)
+}
+
+// sendStartupMessage sends a message to the Discord channel when the bot starts up
+func sendStartupMessage(s *discordgo.Session, channelID string) {
+	message := "💪 Gym Bot is online and ready to pump some iron! Use `/gym` to log your sessions!"
+	_, err := s.ChannelMessageSend(channelID, message)
+	if err != nil {
+		log.Printf("Error sending startup message: %v", err)
+	}
+}
+
+// sendShutdownMessage sends a message to the Discord channel when the bot shuts down
+func sendShutdownMessage(s *discordgo.Session, channelID string) {
+	message := "👋 Gym Bot is shutting down. See you at the gym next time!"
+	_, err := s.ChannelMessageSend(channelID, message)
+	if err != nil {
+		log.Printf("Error sending shutdown message: %v", err)
+	}
 }
 
 func onInteraction(s *discordgo.Session, i *discordgo.InteractionCreate) {
