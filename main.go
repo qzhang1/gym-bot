@@ -332,26 +332,21 @@ func handleGymLog(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		return
 	}
 
-	// Calculate current streak after committing
-	currentStreak := calculateCurrentStreak(ctx, user.ID)
+	// Calculate workouts this week after committing
+	var workoutsThisWeek int
+	err = tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) 
+		FROM workouts 
+		WHERE user_id = ? AND strftime('%W', timestamp) = strftime('%W', 'now')
+	`, user.ID).Scan(&workoutsThisWeek)
+	if err != nil {
+		log.Printf("Error counting weekly workouts for user %s: %v", user.Username, err)
+		workoutsThisWeek = -1 // Default to -1 (indicating an error)
+	}
 
 	// Build response message
 	message := fmt.Sprintf("🏋️ **%s**, workout logged! You've gone **%d** times in %d.", user.Username, total, currentYear)
-
-	if currentStreak > 0 {
-		message += fmt.Sprintf(" 🔥 Current streak: **%d days**!", currentStreak)
-	}
-
-	// Special milestone messages
-	if currentStreak == 7 {
-		message += " 🎉 **ONE WEEK STREAK!**"
-	} else if currentStreak == 30 {
-		message += " 🎊 **ONE MONTH STREAK!**"
-	} else if currentStreak == 100 {
-		message += " 👑 **100 DAY STREAK! ABSOLUTE LEGEND!**"
-	} else if currentStreak%10 == 0 && currentStreak > 0 {
-		message += fmt.Sprintf(" 💪 Keep it up!")
-	}
+	message += fmt.Sprintf(" 💪 **%d** workouts this week!", workoutsThisWeek)
 
 	sendResponse(s, i, message)
 }
