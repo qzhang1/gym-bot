@@ -332,16 +332,16 @@ func handleGymLog(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		return
 	}
 
-	// Calculate workouts this week after committing
+	// Calculate workouts this week after committing (use db, not tx)
 	var workoutsThisWeek int
-	err = tx.QueryRowContext(ctx, `
+	err = db.QueryRowContext(ctx, `
 		SELECT COUNT(*) 
 		FROM workouts 
 		WHERE user_id = ? AND strftime('%W', timestamp) = strftime('%W', 'now')
 	`, user.ID).Scan(&workoutsThisWeek)
 	if err != nil {
 		log.Printf("Error counting weekly workouts for user %s: %v", user.Username, err)
-		workoutsThisWeek = -1 // Default to -1 (indicating an error)
+		workoutsThisWeek = 0 // Default to -1 (indicating an error)
 	}
 
 	// Build response message
@@ -834,7 +834,7 @@ func GenerateInsult(username string, sessionsThisWeek int, daysSinceLastSession 
 		username, daysSinceLastSession, sessionsThisWeek)
 
 	payload := OllamaRequest{
-		Model:  "llama3",
+		Model:  "qwen3:4b",
 		Prompt: prompt,
 		Stream: false,
 	}
